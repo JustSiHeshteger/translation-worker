@@ -10,19 +10,23 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import signal
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import ConsumerRecord, TopicPartition
 from redis.asyncio import Redis, from_url
+from redis.exceptions import RedisError
 
 from translation_worker import _contract, cloudevents
 from translation_worker.cache import TranslationCache
 from translation_worker.config import Settings
 from translation_worker.kafka_consumer import (
+    ACTION_BUSY,
     IncomingRecord,
     RedisDedup,
     TranslationConsumer,
@@ -34,7 +38,52 @@ from translation_worker.telemetry import StageTiming
 
 _LOG = logging.getLogger(__name__)
 
-_HEALTH_BODY = b'{"status":"UP"}'
+# Интервал проверки зависимостей для `/ready`.
+_READY_REFRESH_SECONDS = 15.0
+
+# Сколько ждать снятия резерва дедупа при остановке; меньше
+# terminationGracePeriodSeconds в манифесте, чтобы под успел погаситься сам.
+_SHUTDOWN_GRACE_SECONDS = 10.0
+
+# Чанк ожидания чужого резерва: партиция на паузе, остальные продолжают течь.
+_BUSY_WAIT_CHUNK_SECONDS = 15.0
+
+# Бюджет ожидания чужого резерва: дольше TTL резерва ждать бессмысленно —
+# после его истечения запись возьмёт кто угодно.
+_busy_budget_override: float | None = None
+_busy_wait: dict[tuple[TopicPartition, int], float] = {}
+
+
+class _RecordBusy(Exception):
+    """Запись занята другой репликой: оффсет коммитить нельзя."""
+
+
+class _BusyUnresolved(Exception):
+    """Занятость не разрешилась за бюджет ожидания: цикл останавливается."""
+
+
+@dataclass
+class DependencyState:
+    """Состояние зависимостей для readiness-пробы `/ready`.
+
+    Liveness `/health` зависимости намеренно игнорирует: рестарт живого воркера
+    из-за недоступного Redis не помогает, а теряет уже сделанную работу.
+    """
+
+    # до первого подтверждения проба честно неготов: `_consume` поднимет
+    # kafka, первый успешный PING — redis
+    kafka: bool = False
+    redis: bool = False
+
+    def payload(self) -> dict[str, Any]:
+        healthy = self.kafka and self.redis
+        return {
+            "status": "UP" if healthy else "DOWN",
+            "dependencies": {
+                "kafka": "ok" if self.kafka else "down",
+                "redis": "ok" if self.redis else "down",
+            },
+        }
 
 # Предел повторов обработки одной записи перед осознанным пропуском:
 # без него устойчивый сбой публикации/Redis заклинил бы партицию навсегда.
@@ -85,6 +134,7 @@ async def _main() -> int:
         redis,
         prefix=settings.dedup_prefix,
         ttl_seconds=settings.dedup_ttl_seconds,
+        inflight_ttl_seconds=settings.dedup_inflight_ttl_seconds,
     )
     producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap,
@@ -119,44 +169,92 @@ async def _main() -> int:
         schema_path=schema_path,
     )
 
-    await producer.start()
-    await consumer.start()
-    health = await asyncio.start_server(_serve_health, host="0.0.0.0", port=settings.health_port)
-    _LOG.info(
-        "translation-worker запущен: топик %s, группа %s, провайдеры ocr=%s translate=%s,"
-        " порт проб %d",
-        settings.requests_topic,
-        settings.group_id,
-        settings.ocr_provider,
-        settings.translate_provider,
-        settings.health_port,
-    )
+    # Сбой старта не должен оставлять открытыми уже поднятые клиенты:
+    # `finally` основного блока на этот момент ещё не активен.
+    started: list[Any] = []
     try:
-        consume_task = asyncio.create_task(_consume(consumer, handler))
+        await producer.start()
+        started.append(producer)
+        await consumer.start()
+        started.append(consumer)
+    except Exception:
+        for client in reversed(started):
+            with contextlib.suppress(Exception):
+                await client.stop()
+        with contextlib.suppress(Exception):
+            await redis.aclose()
+        raise
+    dependencies = DependencyState()
+    health: asyncio.AbstractServer | None = None
+    tasks: list[asyncio.Task[Any]] = []
+    consume_task: asyncio.Task[Any] | None = None
+    consume_cancelled = False
+    try:
+        # сервер проб поднимается ВНУТРИ защищённого блока: занятый порт
+        # (частый случай рестарта пода) иначе уводил бы из функции с
+        # открытыми Kafka-клиентами и Redis
+        health = await asyncio.start_server(
+            lambda reader, writer: _serve_health(reader, writer, dependencies),
+            host="0.0.0.0",
+            port=settings.health_port,
+        )
+        _LOG.info(
+            "translation-worker запущен: топик %s, группа %s, провайдеры ocr=%s translate=%s,"
+            " порт проб %d",
+            settings.requests_topic,
+            settings.group_id,
+            settings.ocr_provider,
+            settings.translate_provider,
+            settings.health_port,
+        )
+        consume_task = asyncio.create_task(_consume(consumer, handler, dependencies))
+        ready_task = asyncio.create_task(_refresh_redis(redis, dependencies))
         stop_task = asyncio.create_task(stop.wait())
+        tasks = [consume_task, ready_task, stop_task]
         done, _pending = await asyncio.wait(
             {consume_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
         )
+        dependencies.kafka = False
         if consume_task in done:
             consume_task.result()
             _LOG.error("цикл consume завершился сам — останавливаем сервис")
-            stop_task.cancel()
             return 1
-        _LOG.info("получен сигнал остановки: дожидаемся завершения текущей записи")
+        # SIGTERM: задание не обрывается мгновенно — отмена доходит до
+        # обработчика, который снимает резерв дедупа, и только потом клиенты
+        # закрываются (release под shield обязан успеть)
+        _LOG.info("получен сигнал остановки: прерываем текущую запись и снимаем резерв")
         consume_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await consume_task
+        consume_cancelled = True
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.wait({consume_task}, timeout=_SHUTDOWN_GRACE_SECONDS)
         return 0
     finally:
-        health.close()
-        await health.wait_closed()
-        await consumer.stop()
-        await producer.stop()
-        await redis.aclose()
+        for task in tasks:
+            # уже отменённую задачу не трогаем: повторный CancelledError
+            # оборвал бы shield-release резерва
+            if task is consume_task and consume_cancelled:
+                continue
+            task.cancel()
+        # отменённые задачи надо ДОЖДАТЬСЯ: иначе finally закроет Redis, пока
+        # фоновый PING ещё в нём, и клиент упадёт на закрытом соединении
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if health is not None:
+            health.close()
+            with contextlib.suppress(Exception):
+                await health.wait_closed()
+        with contextlib.suppress(Exception):
+            await consumer.stop()
+        with contextlib.suppress(Exception):
+            await producer.stop()
+        with contextlib.suppress(Exception):
+            await redis.aclose()
 
 
 async def _consume(
-    consumer: AIOKafkaConsumer, handler: TranslationConsumer
+    consumer: AIOKafkaConsumer,
+    handler: TranslationConsumer,
+    state: DependencyState | None = None,
 ) -> None:
     """Цикл consume: коммит оффсета — только после обработки и публикации исхода.
 
@@ -165,10 +263,66 @@ async def _consume(
     (таймаут + ограниченные повторы + WARN-продолжение). Запись, которую
     обработать не удалось, остаётся незакоммиченной и будет доставлена снова.
     """
+    if state is not None:
+        state.kafka = True
+    try:
+        await _consume_loop(consumer, handler)
+    except _BusyUnresolved:
+        # резерв чужой реплики жив дольше нашего бюджета: дальнейшая работа с
+        # этой партией отравила бы оффсет, поэтому выходим и перечитываем
+        # с последнего закоммиченного оффсета после рестарта
+        _LOG.error("цикл consume остановлен: занятая запись не разрешилась")
+    finally:
+        if state is not None:
+            state.kafka = False
+
+
+async def _consume_loop(consumer: AIOKafkaConsumer, handler: TranslationConsumer) -> None:
+    """Тело цикла consume (вынесено, чтобы флаг готовности сбрасывался в finally)."""
     async for record in consumer:
         incoming = _to_incoming(record)
         try:
             result = await handler.handle_record(incoming)
+            if result.action == ACTION_BUSY:
+                raise _RecordBusy
+        except _RecordBusy:
+            # Событие обрабатывает другая реплика. Оффсет коммитить НЕЛЬЗЯ:
+            # коммит следующей записи той же партиции сдвинул бы позицию ЗА
+            # занятую, и при падении владельца задание исчезло бы навсегда.
+            # Поэтому партиция ставится на паузу и ждёт, пока резерв истечёт
+            # (или владелец его снимет); ждём не дольше TTL резерва.
+            partition = TopicPartition(record.topic, record.partition)
+            waited = _busy_wait.get((partition, record.offset), 0.0)
+            budget = _busy_budget()
+            if waited >= budget:
+                _LOG.error(
+                    "запись %s/%s@%d: занята дольше %.0f с (бюджет): останавливаем цикл,"
+                    " оффсет НЕ коммитим — задание вернётся после рестарта",
+                    record.topic,
+                    record.partition,
+                    record.offset,
+                    budget,
+                )
+                _busy_wait.pop((partition, record.offset), None)
+                raise _BusyUnresolved from None
+            pause_for = min(_BUSY_WAIT_CHUNK_SECONDS, budget - waited)
+            _busy_wait[(partition, record.offset)] = waited + pause_for
+            await consumer.pause(partition)
+            try:
+                await consumer.seek(partition, record.offset)
+                _LOG.info(
+                    "запись %s/%s@%d: занята другой репликой, пауза %.0f с (%.0f/%.0f)",
+                    record.topic,
+                    record.partition,
+                    record.offset,
+                    pause_for,
+                    waited + pause_for,
+                    budget,
+                )
+                await asyncio.sleep(pause_for)
+            finally:
+                await consumer.resume(partition)
+            continue
         except Exception:
             # Оффсет не коммитим: следующая запись той же партиции
             # перепрыгнула бы упавшую. Отматываем позицию назад и пробуем
@@ -211,6 +365,9 @@ async def _consume(
                 exc_info=True,
             )
             continue
+        # успешная запись снимает свою историю повторов: иначе модульный
+        # счётчик растёт на долгоживущем поде
+        _retries.pop((TopicPartition(record.topic, record.partition), record.offset), None)
         _LOG.debug(
             "запись %s/%s@%d: %s, топики: %s",
             record.topic,
@@ -257,24 +414,81 @@ def _to_incoming(record: ConsumerRecord) -> IncomingRecord:
     return IncomingRecord(key=key, value=record.value, headers=headers)
 
 
-async def _serve_health(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """Минимальный HTTP-ответ пробе: GET /health → 200 {"status":"UP"}."""
+async def _serve_health(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    state: DependencyState,
+) -> None:
+    """Пробы сервиса: `/health` — liveness, `/ready` — готовность зависимостей."""
     try:
-        await reader.readuntil(b"\r\n\r\n")
-    except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError):
-        pass
+        # молчащий клиент не должен оставлять висящую корутину: проба
+        # отваливается по timeoutSeconds, а корутина жила бы до закрытия
+        request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+    except (TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, OSError):
+        request = b""
+    path = _request_path(request)
+    if path == "/ready":
+        payload: dict[str, Any] = state.payload()
+        code, reason = (200, "OK") if payload["status"] == "UP" else (503, "Service Unavailable")
+    elif path == "/health":
+        payload, code, reason = {"status": "UP"}, 200, "OK"
+    else:
+        payload, code, reason = {"status": "NOT_FOUND"}, 404, "Not Found"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     head = (
-        b"HTTP/1.1 200 OK\r\n"
-        b"Content-Type: application/json\r\n"
-        b"Connection: close\r\n"
-        b"Content-Length: " + str(len(_HEALTH_BODY)).encode("ascii") + b"\r\n\r\n"
-    )
+        f"HTTP/1.1 {code} {reason}\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode("ascii")
     with contextlib.suppress(OSError):
-        writer.write(head + _HEALTH_BODY)
+        writer.write(head + body)
         await writer.drain()
     writer.close()
     with contextlib.suppress(OSError):
         await writer.wait_closed()
+
+
+async def _refresh_redis(
+    redis: Redis,
+    state: DependencyState,
+    interval: float = _READY_REFRESH_SECONDS,
+) -> None:
+    """Держать readiness в актуальном состоянии: PING раз в N секунд.
+
+    Проба не должна ходить в сеть на каждый запрос (k8s опрашивает часто),
+    а `/ready` обязан замечать пропажу Redis в пределах пары интервалов.
+    """
+    while True:
+        try:
+            await asyncio.wait_for(redis.ping(), timeout=5)
+            state.redis = True
+        except (TimeoutError, OSError, RedisError):
+            # недоступность Redis — «не готов»; программные ошибки (AttributeError)
+            # не глушим, иначе поломка кода выглядела бы как падение зависимости
+            state.redis = False
+        await asyncio.sleep(interval)
+
+
+def _busy_budget() -> float:
+    """Сколько секунд ждать разрешения чужого резерва (TTL резерва)."""
+    if _busy_budget_override is not None:
+        return _busy_budget_override
+    try:
+        from translation_worker.config import Settings
+
+        return float(Settings().dedup_inflight_ttl_seconds)
+    except Exception:  # noqa: BLE001 - конфиг недоступен: безопасный минимум
+        return 300.0
+
+
+def _request_path(request: bytes) -> str:
+    """Путь из первой строки HTTP-запроса (`GET /ready HTTP/1.1`)."""
+    line = request.split(b"\r\n", 1)[0]
+    parts = line.split(b" ")
+    if len(parts) < 2:
+        return ""
+    return parts[1].decode("utf-8", errors="replace").split("?", 1)[0]
 
 
 def _install_signal_handlers(stop: asyncio.Event) -> None:

@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import uuid as _uuid
@@ -26,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 from translation_worker import cloudevents, events
 from translation_worker.config import Settings
@@ -40,7 +43,8 @@ def _is_diagnosable(book_id: str, language: str) -> bool:
     """
     if not book_id or not language or len(language) > 32:
         return False
-    if not language.isprintable() or " " in language:
+    # контракт допускает строку 1…32 символов: запрещаем только control-символы
+    if any(character < " " or character == "\x7f" for character in language):
         return False
     try:
         _uuid.UUID(book_id)
@@ -49,11 +53,25 @@ def _is_diagnosable(book_id: str, language: str) -> bool:
     return True
 
 ACTION_COMPLETED = "completed"
+ACTION_BUSY = "busy"
 ACTION_FAILED = "failed"
 ACTION_DLQ = "dlq"
 ACTION_SKIPPED = "skipped"
 ACTION_DUPLICATE = "duplicate"
 ACTION_POISON = "poison"
+
+# Атомарное снятие своего резерва: сравнение токена и DEL в одном скрипте.
+_DELETE_IF_TOKEN_MATCHES = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+# Состояния резерва дедупа (`RedisDedup.acquire`).
+ACQUIRE_ACQUIRED = "acquired"
+ACQUIRE_DUPLICATE = "duplicate"
+ACQUIRE_BUSY = "busy"
 
 REASON_MAX_RETRIES = "MAX_RETRIES_EXCEEDED"
 REASON_NON_RETRYABLE = "NON_RETRYABLE_ERROR"
@@ -87,11 +105,13 @@ class Publisher(Protocol):
 
 
 class DedupStore(Protocol):
-    """Идемпотентность по `ce-id` (Redis, TTL 24h)."""
+    """Идемпотентность по `ce-id`: резерв «в работе» + отметка «готово»."""
 
-    async def seen(self, event_id: str) -> bool: ...
+    async def acquire(self, event_id: str) -> str: ...
 
-    async def mark(self, event_id: str) -> None: ...
+    async def complete(self, event_id: str) -> None: ...
+
+    async def release(self, event_id: str) -> None: ...
 
 
 class PagePipeline(Protocol):
@@ -123,7 +143,12 @@ class TranslationConsumer:
         self._schema_path = schema_path
 
     async def handle_record(self, record: IncomingRecord) -> HandleResult:
-        """Обработать одну запись; исключения наружу не выпускаются."""
+        """Обработать одну запись и вернуть исход.
+
+        Пайплайн-исключение превращается в событие `Failed`, а вот сбой
+        публикации/дедупа наружу выпускается осознанно: цикл consume отматывает
+        оффсет и повторяет запись с бэкоффом (резерв при этом уже снят).
+        """
         headers = record.headers or {}
         if record.value is None:
             _LOG.info("tombstone: пропуск записи ключа %s", record.key)
@@ -138,10 +163,43 @@ class TranslationConsumer:
         if payload is None:
             _LOG.warning("poison-payload (не JSON), ce-id=%s: пропуск", correlation_id)
             return HandleResult(ACTION_POISON)
-        if await self._is_duplicate(correlation_id):
+        try:
+            acquired = await self._acquire(correlation_id)
+        except asyncio.CancelledError:
+            # отмена посреди резерва: свою бронь снимаем, иначе она висела бы
+            # TTL и превращала запись в «занятую» для всех остальных
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._release(correlation_id))
+            raise
+        if acquired == ACQUIRE_DUPLICATE:
             _LOG.info("дубликат ce-id=%s: пропуск", correlation_id)
             return HandleResult(ACTION_DUPLICATE)
+        if acquired == ACQUIRE_BUSY:
+            # событие обрабатывает другая реплика: оффсет коммитить НЕЛЬЗЯ,
+            # иначе при её падении задание потеряется без события
+            _LOG.info("ce-id=%s уже в работе: оффсет не коммитим", correlation_id)
+            return HandleResult(ACTION_BUSY)
+        try:
+            return await self._handle_acquired(payload, correlation_id)
+        except asyncio.CancelledError:
+            # остановка пода: резерв снимаем под shield — в уже отменённом
+            # контексте обычный await получил бы второй CancelledError
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._release(correlation_id))
+            raise
+        except Exception:
+            # исхода нет (сбой публикации/Redis): резерв снимаем, запись
+            # будет доставлена повторно, а не «залипнет» занятой
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._release(correlation_id))
+            raise
 
+    async def _handle_acquired(
+        self,
+        payload: dict[str, Any],
+        correlation_id: str | None,
+    ) -> HandleResult:
+        """Обработка события, право на которое уже занято через `acquire`."""
         try:
             request = events.parse_requested(payload, path=self._schema_path)
         except events.SchemaValidationError as exc:
@@ -330,21 +388,29 @@ class TranslationConsumer:
         )
         await self._publisher.publish(topic, event)
 
-    async def _is_duplicate(self, correlation_id: str | None) -> bool:
+    async def _acquire(self, correlation_id: str | None) -> str:
+        """Занять событие: `acquired` | `duplicate` | `busy`."""
         if not correlation_id or self._dedup is None:
-            return False
-        return await self._dedup.seen(correlation_id)
+            return ACQUIRE_ACQUIRED
+        return await self._dedup.acquire(correlation_id)
 
     async def _mark(self, correlation_id: str | None) -> None:
         if correlation_id and self._dedup is not None:
-            await self._dedup.mark(correlation_id)
+            await self._dedup.complete(correlation_id)
+
+    async def _release(self, correlation_id: str | None) -> None:
+        if correlation_id and self._dedup is not None:
+            await self._dedup.release(correlation_id)
 
 
 class RedisDedup:
     """Дедуп по `ce-id` в Redis: ключ `{prefix}{ce-id}`, TTL сутки (§2.16).
 
-    Клиент передаётся снаружи (`redis.asyncio.Redis`), чтобы модуль логики
-    консьюмера не тянул сетевые зависимости в тестах.
+    Два ключа: `{prefix}{ce-id}` — «обработано» (TTL сутки) и
+    `{prefix}inflight:{ce-id}` — резерв «в работе» с КОРОТКИМ TTL и токеном
+    владельца (снятие — атомарным compare-and-delete). Клиент передаётся
+    снаружи (`redis.asyncio.Redis`), чтобы модуль логики консьюмера не тянул
+    сетевые зависимости в тестах.
     """
 
     def __init__(
@@ -353,19 +419,101 @@ class RedisDedup:
         *,
         prefix: str = "translation-cache/dedup:",
         ttl_seconds: int = 86_400,
+        inflight_ttl_seconds: int | None = None,
     ) -> None:
+        if inflight_ttl_seconds is None:
+            raise TypeError("inflight_ttl_seconds обязателен: он не равен TTL готовности")
+        if not 0 < inflight_ttl_seconds < ttl_seconds:
+            raise ValueError(
+                f"TTL резерва ({inflight_ttl_seconds}) должен быть меньше"
+                f" TTL готовности ({ttl_seconds})"
+            )
         self._client = client
         self._prefix = prefix
         self._ttl = ttl_seconds
+        # TTL резерва «в работе» — отдельный и короткий: с TTL отметки «готово»
+        # (сутки) упавшая реплика оставляла бы резерв, а новую доставку того же
+        # ce-id воркер принимал бы за дубликат и задание терялось навсегда.
+        self._inflight_ttl = inflight_ttl_seconds
+        self._tokens: dict[str, str] = {}
 
     def key(self, event_id: str) -> str:
+        """Ключ «событие обработано» (TTL сутки)."""
         return f"{self._prefix}{event_id}"
 
-    async def seen(self, event_id: str) -> bool:
-        return bool(await self._client.exists(self.key(event_id)))
+    def inflight_key(self, event_id: str) -> str:
+        """Ключ резерва «событие в работе» (TTL резерва)."""
+        return f"{self._prefix}inflight:{event_id}"
 
-    async def mark(self, event_id: str) -> None:
+    async def acquire(self, event_id: str) -> str:
+        """Атомарно занять событие; вернуть `ACQUIRED` | `DUPLICATE` | `BUSY`.
+
+        Три состояния вместо булева флага принципиальны: «уже обработано» и
+        «обрабатывается другой репликой» требуют РАЗНОЙ реакции. Дубликат
+        можно коммитить, а занятое чужое — нельзя: оффсет нужно отмотать и
+        попробовать снова, иначе задание (первый воркер упал, оффсет не
+        закоммичен) молча теряется.
+
+        Резерв берётся `SET NX` с отдельным (коротким) TTL и хранит токен
+        владельца: снять чужой резерв после истечения своего TTL нельзя.
+        """
+        if await self._client.exists(self.key(event_id)):
+            return ACQUIRE_DUPLICATE
+        token = uuid4().hex
+        # токен записывается ДО SET: если отмена придёт во время команды,
+        # Redis её уже применил, и снять бронь будет нечем
+        self._tokens[event_id] = token
+        try:
+            reserved = await self._client.set(
+                self.inflight_key(event_id), token, nx=True, ex=self._inflight_ttl
+            )
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._delete_own(event_id))
+            raise
+        except Exception:
+            self._tokens.pop(event_id, None)
+            raise
+        if not reserved:
+            self._tokens.pop(event_id, None)
+            # гонка: пока мы шли сюда, событие могли завершить
+            if await self._client.exists(self.key(event_id)):
+                return ACQUIRE_DUPLICATE
+            return ACQUIRE_BUSY
+        # перепроверка «готово» уже ПОСЛЕ резерва: иначе гонка
+        # done→release-резерва-другого-процесса даёт повторную обработку
+        if await self._client.exists(self.key(event_id)):
+            await self._delete_own(event_id)
+            return ACQUIRE_DUPLICATE
+        return ACQUIRE_ACQUIRED
+
+    async def complete(self, event_id: str) -> None:
+        """Отметить событие обработанным и снять свой резерв."""
         await self._client.set(self.key(event_id), "1", ex=self._ttl)
+        await self._delete_own(event_id)
+
+    async def release(self, event_id: str) -> None:
+        """Снять свой резерв без отметки: событие будет доставлено повторно."""
+        await self._delete_own(event_id)
+
+    async def _delete_own(self, event_id: str) -> None:
+        """Удалить резерв, только если он наш.
+
+        Сравнение и удаление — одним `EVAL`: пара `GET` → `DEL` не атомарна, и
+        между ними резерв мог истечь и достаться новой реплике, чей токен мы бы
+        и снесли (двойная обработка одного `ce-id`).
+        """
+        token = self._tokens.pop(event_id, None)
+        if token is None:
+            return
+        await self._client.eval(_DELETE_IF_TOKEN_MATCHES, 1, self.inflight_key(event_id), token)
+
+
+def _text(value: Any) -> str:
+    """Значение Redis как строка (redis-py может вернуть bytes)."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _parse_json(value: str | bytes) -> dict[str, Any] | None:

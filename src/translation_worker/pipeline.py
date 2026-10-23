@@ -119,7 +119,14 @@ class Pipeline:
         request: events.ComicTranslationRequested,
         on_progress: Callable[[events.ComicTranslationProgress], Awaitable[None]] | None = None,
     ) -> events.ComicTranslationCompleted | events.ComicTranslationFailed:
-        """Обработать задание целиком и вернуть событие исхода."""
+        """Обработать задание целиком и вернуть событие исхода.
+
+        В события исхода превращаются ровно два класса сбоев — таймаут задания
+        и `_PageFailure` (код стадии + страница). Любые прочие исключения
+        (например, недоступный S3 при записи манифеста) пробрасываются
+        наружу: консьюмер превращает их в retryable `INTERNAL_ERROR`, поэтому
+        молча «проглотить» их здесь нельзя.
+        """
         if self._timings is not None:
             # тайминги принадлежат ОДНОМУ заданию (консьюмер живёт процессом)
             self._timings.reset()
