@@ -1,0 +1,8 @@
+# Контекст сборки translation-worker — корень монорепо (нужен контракт
+# asyncapi, чтобы источник правды оставался в books-platform-openapi).
+# В образ попадают только файлы сервиса и контракт событий.
+**
+!translation-worker/requirements.txt
+!translation-worker/pyproject.toml
+!translation-worker/src/**
+!books-platform-openapi/asyncapi/comic-translation-events.yaml

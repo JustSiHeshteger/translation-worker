@@ -1,0 +1,9 @@
+# venv и кэши инструментов не коммитим
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
