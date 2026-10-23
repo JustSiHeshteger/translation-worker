@@ -9,6 +9,7 @@ Failed(INTERNAL_ERROR) + DLQ SCHEMA_VALIDATION_FAILED.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,15 +28,36 @@ SCHEMA = (
 
 
 class FakeDedup:
-    def __init__(self, seen_ids: set[str] | None = None) -> None:
+    """Дедуп-двойник с трёхместным резервом (§2.16, `SET NX`)."""
+
+    def __init__(self, seen_ids: set[str] | None = None, busy_ids: set[str] | None = None) -> None:
         self.seen_ids = seen_ids or set()
+        self.busy_ids = busy_ids or set()
         self.marked: list[str] = []
+        self.released: list[str] = []
+        self.inflight: set[str] = set()
 
-    async def seen(self, event_id: str) -> bool:
-        return event_id in self.seen_ids
+    async def acquire(self, event_id: str) -> str:
+        from translation_worker.kafka_consumer import (
+            ACQUIRE_ACQUIRED,
+            ACQUIRE_BUSY,
+            ACQUIRE_DUPLICATE,
+        )
 
-    async def mark(self, event_id: str) -> None:
+        if event_id in self.seen_ids:
+            return ACQUIRE_DUPLICATE
+        if event_id in self.busy_ids or event_id in self.inflight:
+            return ACQUIRE_BUSY
+        self.inflight.add(event_id)
+        return ACQUIRE_ACQUIRED
+
+    async def complete(self, event_id: str) -> None:
+        self.inflight.discard(event_id)
         self.marked.append(event_id)
+
+    async def release(self, event_id: str) -> None:
+        self.inflight.discard(event_id)
+        self.released.append(event_id)
 
 
 class StubPipeline:
@@ -271,3 +293,113 @@ async def test_pipeline_crash_becomes_failure_event_not_exception(
     # непойманное исключение пайплайна не должно уронить консюмер без события
     assert outcome.action in {"dlq", "failed"}
     assert publisher.types()[0] == cloudevents.TYPE_FAILED
+
+# ── Резерв дедупа и отмена (known issues ревью) ────────────────
+
+
+class _FailingPublisher:
+    """Публикация исхода падает: исход не доставлен, резерв должен быть снят."""
+
+    def __init__(self) -> None:
+        self.published: list[str] = []
+
+    async def publish(self, topic: str, event) -> None:
+        raise ConnectionError("kafka is down")
+
+
+class _CancellingPipeline:
+    """SIGTERM посреди задания: пайплайн отменён."""
+
+    async def process(self, request, on_progress=None):
+        raise asyncio.CancelledError
+
+
+async def test_reservation_released_when_outcome_publish_fails(
+    settings, request_payload
+):
+    dedup = FakeDedup()
+    consumer = TranslationConsumer(
+        settings,
+        StubPipeline(completed()),
+        _FailingPublisher(),
+        dedup=dedup,
+        schema_path=SCHEMA,
+    )
+
+    with pytest.raises(ConnectionError):
+        await consumer.handle_record(record(request_payload()))
+
+    assert dedup.released == ["evt-1"], "резерв снимается, чтобы запись дошла повторно"
+    assert dedup.marked == [], "отметка «готово» ставится только после публикации исхода"
+    assert dedup.inflight == set()
+
+
+async def test_busy_event_is_not_treated_as_duplicate(consumer_factory, publisher, request_payload):
+    consumer, pipeline = consumer_factory(completed(), dedup=FakeDedup(busy_ids={"evt-1"}))
+
+    outcome = await consumer.handle_record(record(request_payload()))
+
+    assert outcome.action == "busy", "занятое чужой репликой нельзя коммитить как дубликат"
+    assert outcome.published == []
+    assert pipeline.requests == []
+    assert publisher.published == []
+
+
+async def test_processing_without_dedup_still_works(settings, request_payload, publisher):
+    consumer = TranslationConsumer(
+        settings, StubPipeline(completed()), publisher, dedup=None, schema_path=SCHEMA
+    )
+
+    outcome = await consumer.handle_record(record(request_payload()))
+
+    assert outcome.action == "completed"
+
+
+async def test_cancellation_releases_reservation(settings, request_payload):
+    dedup = FakeDedup()
+    consumer = TranslationConsumer(
+        settings, _CancellingPipeline(), publisher=None, dedup=dedup, schema_path=SCHEMA
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await consumer.handle_record(record(request_payload()))
+
+    assert dedup.released == ["evt-1"], "остановка пода не должна оставлять резерв"
+
+class _SlowDedup(FakeDedup):
+    """`release` уступает управление — так проверяется `asyncio.shield`."""
+
+    async def release(self, event_id: str) -> None:
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await super().release(event_id)
+
+
+class _BlockingPipeline:
+    """Задание в работе: корутина ждёт отмены (SIGTERM посреди страницы)."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def process(self, request, on_progress=None):
+        self.started.set()
+        await asyncio.sleep(3600)
+
+
+async def test_release_survives_double_cancellation(settings, request_payload):
+    """Второй `cancel()` не должен обрывать снятие резерва (иначе фантомный busy)."""
+    dedup = _SlowDedup()
+    pipeline = _BlockingPipeline()
+    consumer = TranslationConsumer(
+        settings, pipeline, publisher=None, dedup=dedup, schema_path=SCHEMA
+    )
+
+    task = asyncio.create_task(consumer.handle_record(record(request_payload())))
+    await asyncio.wait_for(pipeline.started.wait(), timeout=5)
+
+    task.cancel()
+    task.cancel()  # отмена приходит ещё раз, пока release уже в полёте
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert dedup.released == ["evt-1"], "резерв обязан быть снят даже при двойной отмене"

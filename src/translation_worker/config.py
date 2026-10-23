@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     cache_prefix: str = "translation-cache/"
     dedup_prefix: str = "translation-cache/dedup:"
     dedup_ttl_seconds: int = Field(default=86_400, ge=1)
+    # TTL резерва «событие в работе» — НЕ равен TTL отметки «готово»: упавший
+    # воркер не должен отдавать задание повторно раньше, чем закончится его
+    # собственный таймаут, но и держать резерв сутками нельзя (задание
+    # считалось бы дубликатом и терялось).
+    dedup_inflight_ttl_seconds: int = Field(default=2_100, ge=1)
     font_path: str = ""
     schema_path: str = "schemas/comic-translation-events.yaml"
     health_port: int = Field(default=8093, ge=1, le=65_535)
