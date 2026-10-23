@@ -1,0 +1,6 @@
+# ML-стек translation-worker: НЕ ставится в CI (нет GPU и моделей в тестах).
+# Провайдеры OcrProvider/Translator инъектируются конфигурацией
+# (TRANSLATION_OCR_PROVIDER=manga / TRANSLATION_TRANSLATE_PROVIDER=LLM), в
+# тестах используются fakes из tests/conftest.py.
+torch>=2.4
+manga-ocr>=0.1.13

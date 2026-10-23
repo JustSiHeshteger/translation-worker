@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "translation-worker"
+version = "0.1.0"
+description = "BookPlatform: конвейер автоперевода комиксов (фаза 1 — текстовый слой)"
+requires-python = ">=3.12"
+# Зависимости утверждает облако: они живут в requirements.txt (минимум) и
+# requirements-ml.txt (torch/manga-ocr, в CI не ставится). Здесь — только
+# метаданные пакета и конфигурация инструментов.
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:translation_worker.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "I001"]
