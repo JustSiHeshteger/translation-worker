@@ -14,11 +14,14 @@
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 
 from PIL import ImageFont
 
 from translation_worker.models import Box, TextBlock
+
+_LOG = logging.getLogger(__name__)
 
 # Доля высоты бабла, доступная тексту (остальное — отступы и «воздух»).
 _MAX_TEXT_HEIGHT_SHARE = 0.5
@@ -108,7 +111,16 @@ def _wrap(text: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont, width: 
 
 @lru_cache(maxsize=64)
 def _font(font_path: str, size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-    """Шрифт нужного кегля; без TTF (тесты и dev) — встроенный шрифт Pillow."""
+    """Шрифт нужного кегля; без TTF (тесты и dev) — встроенный шрифт Pillow.
+
+    Битый файл шрифта не валит страницу: путь проверяется на старте
+    (`Settings`), но файл могли удалить под работающим подом — деградируем на
+    встроенный шрифт с предупреждением вместо `LAYOUT_FAILED` на каждой книге.
+    """
     if font_path:
-        return ImageFont.truetype(font_path, size)
+        try:
+            return ImageFont.truetype(font_path, size)
+        except OSError:
+            _LOG.warning("font %s is unreadable, falling back to the default font", font_path)
+            return ImageFont.load_default(size=size)
     return ImageFont.load_default(size=size)

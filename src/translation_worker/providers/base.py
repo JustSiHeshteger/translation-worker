@@ -65,6 +65,10 @@ class BatchTranslator(Protocol):
 
 
 class PageRenderer(Protocol):
-    """Рендер перерисованной страницы (фаза 2, карточка 58); в фазе 1 не используется."""
+    """Рендер перерисованной страницы (фаза 2, карточка 58); в фазе 1 не используется.
 
-    async def render(self, image: bytes, layer: Layer) -> bytes: ...
+    `None` — рендер не удался (или выключен): страница остаётся оверлеем фазы 1,
+    книга продолжается (карточка 58 §2.3). Исключение — `strict_render`.
+    """
+
+    async def render(self, image: bytes, layer: Layer) -> bytes | None: ...

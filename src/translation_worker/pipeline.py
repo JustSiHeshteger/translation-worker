@@ -234,7 +234,7 @@ class Pipeline:
         return PageOutcome(
             number=number,
             layer_key=key,
-            image_key=await self._render_art(run, number, image, layer),
+            image_key=await self._render_art(run, number, image, layer, warnings),
             blocks=len(laid_out),
             warnings=warnings,
         )
@@ -378,12 +378,32 @@ class Pipeline:
             raise _PageFailure("LAYOUT_FAILED", number, _short(exc)) from exc
 
     async def _render_art(
-        self, run: _RunState, number: int, image: bytes, layer: Layer
+        self,
+        run: _RunState,
+        number: int,
+        image: bytes,
+        layer: Layer,
+        warnings: list[str],
     ) -> str | None:
-        """Фаза 2: перерисовка страницы. В фазе 1 рендера нет — `imageKey=None`."""
+        """Фаза 2: перерисовка страницы. Без рендера — `imageKey=None` (фаза 1).
+
+        Сбой рендера книгу не валит: страница отдаётся оверлеем фазы 1, а в
+        предупреждения попадает `page N: art layer skipped` (карточка 58 §2.3).
+        Исключение — `strict_render`: рендер бросает `ProviderError`, и страница
+        падает кодом из контракта (`LAYOUT_FAILED`) по общим правилам.
+        """
         if self._renderer is None:
             return None
-        rendered = await self._renderer.render(image, layer)
+        if not any(block.text and block.text.strip() for block in layer.blocks):
+            # перерисовывать нечего: это не сбой, а отсутствие текста на странице
+            return None
+        try:
+            rendered = await self._renderer.render(image, layer)
+        except ProviderError as exc:
+            raise _PageFailure(exc.code, number, _short(exc)) from exc
+        if rendered is None:
+            warnings.append(f"page {number}: art layer skipped")
+            return None
         key = image_key(run.request.book_id, run.request.language, number)
         await asyncio.to_thread(self._storage.put_bytes, key, rendered, "image/webp")
         return key

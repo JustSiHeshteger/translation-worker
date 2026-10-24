@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -15,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 OcrProviderName = Literal["fake", "http", "manga"]
 TranslateProviderName = Literal["LLM", "DEEPL", "STUB"]
+InpaintProviderName = Literal["none", "http", "fake"]
 
 
 class Settings(BaseSettings):
@@ -71,6 +73,16 @@ class Settings(BaseSettings):
     # считалось бы дубликатом и терялось).
     dedup_inflight_ttl_seconds: int = Field(default=2_100, ge=1)
     font_path: str = ""
+    # ── Арт-слой (фаза 2, карточка 58) ──────────────────────────────────────
+    # Рендер перерисованной страницы выключен по умолчанию: фаза 1 показывает
+    # перевод оверлеем, арт-слой включается осознанно (нужен inpaint-сервис).
+    render_art: bool = False
+    inpaint_provider: InpaintProviderName = "none"
+    inpaint_url: str = ""
+    # строгий режим: сбой инпанта валит страницу кодом LAYOUT_FAILED, иначе
+    # страница тихо остаётся оверлеем фазы 1 (книга не падает)
+    strict_render: bool = False
+    typeset_quality: int = Field(default=85, ge=1, le=100)
     schema_path: str = "schemas/comic-translation-events.yaml"
     health_port: int = Field(default=8093, ge=1, le=65_535)
     log_level: str = "INFO"
@@ -100,5 +112,23 @@ class Settings(BaseSettings):
         if self.translate_provider == "DEEPL" and not self.deepl_api_key:
             raise ValueError(
                 "TRANSLATION_TRANSLATE_PROVIDER=DEEPL требует TRANSLATION_DEEPL_API_KEY"
+            )
+        if self.inpaint_provider == "http" and not self.inpaint_url:
+            raise ValueError(
+                "TRANSLATION_INPAINT_PROVIDER=http требует TRANSLATION_INPAINT_URL "
+                "(адрес сервиса инпанта)"
+            )
+        if self.strict_render and not self.render_art:
+            raise ValueError(
+                "TRANSLATION_STRICT_RENDER=true требует TRANSLATION_RENDER_ART=true "
+                "(без арт-слоя строгий рендер ничего не проверяет)"
+            )
+        if self.font_path and not Path(self.font_path).is_file():
+            # TTF грузит и фаза 1 (LAYOUT), и арт-слой: битый путь уронил бы
+            # ЛЮБУЮ книгу, поэтому настройка проверяется на старте независимо
+            # от TRANSLATION_RENDER_ART
+            raise ValueError(
+                f"TRANSLATION_FONT_PATH={self.font_path} не существует: "
+                "укажите путь к TTF внутри образа (например DejaVuSans.ttf)"
             )
         return self

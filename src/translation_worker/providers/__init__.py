@@ -20,9 +20,19 @@ from translation_worker.providers.base import (
 from translation_worker.providers.deepl import DeepLTranslator
 from translation_worker.providers.fake import FakeOcr, FakeTranslator
 from translation_worker.providers.http_ocr import HttpOcr
+from translation_worker.providers.inpaint import (
+    FakeInpainter,
+    HttpInpainter,
+    Inpainter,
+    InpaintError,
+    NoopInpainter,
+    build_inpainter,
+)
 from translation_worker.providers.llm import LlmTranslator
 from translation_worker.providers.manga import MangaOcrProvider
-from translation_worker.providers.stub import NullRenderer, StubTranslator
+from translation_worker.providers.render import ArtRenderer, build_art_renderer
+from translation_worker.providers.stub import StubTranslator
+from translation_worker.providers.typeset import Typesetter
 
 __all__ = [
     "BatchTranslator",
@@ -32,7 +42,12 @@ __all__ = [
     "HttpOcr",
     "LlmTranslator",
     "MangaOcrProvider",
-    "NullRenderer",
+    "NoopInpainter",
+    "InpaintError",
+    "Inpainter",
+    "FakeInpainter",
+    "HttpInpainter",
+    "ArtRenderer",
     "OcrError",
     "OcrProvider",
     "PageRenderer",
@@ -40,6 +55,9 @@ __all__ = [
     "StubTranslator",
     "TranslationError",
     "Translator",
+    "Typesetter",
+    "build_art_renderer",
+    "build_inpainter",
     "build_ocr",
     "build_renderer",
     "build_translator",
@@ -68,7 +86,7 @@ def build_translator(settings: Settings) -> Translator:
     return StubTranslator()
 
 
+
 def build_renderer(settings: Settings) -> PageRenderer | None:
-    """Рендер арт-слоя: в фазе 1 его нет (арт не перерисовывается, D-001)."""
-    del settings
-    return None
+    """Рендер арт-слоя: `render_art=false` → рендера нет (поведение фазы 1)."""
+    return build_art_renderer(settings)

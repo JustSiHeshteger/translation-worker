@@ -20,7 +20,8 @@
 | — | группировка строк в баблы, шум по `minConfidence` отбрасывается | `grouping.py` |
 | TRANSLATE | перевод реплик (STUB/LLM/DeepL), пакетно по странице; кэш по SHA-256 страницы | `providers/`, `cache.py` |
 | LAYOUT | подбор кегля 10–40 pt, перенос по словам, warning при переполнении | `layout.py` |
-| S3 | `layer.json` по детерминированному ключу | `storage.py` |
+| RENDER | фаза 2 (опционально): inpaint оригинала + вёрстка перевода в баблы → `web.webp` | `providers/inpaint.py`, `providers/typeset.py`, `providers/render.py` |
+| S3 | `layer.json` (и `web.webp` при арт-слое) по детерминированному ключу | `storage.py` |
 
 ## Топики и артефакты
 
@@ -75,6 +76,11 @@ translated/{bookId}/{language}/page/{nnn}/web.webp        # фаза 2 (карт
 | `TRANSLATION_SCHEMA_PATH` | `schemas/comic-translation-events.yaml` | контракт событий (в образе `/app/schemas/...`) |
 | `TRANSLATION_HEALTH_PORT` | `8093` | порт проб: `/health` (liveness) и `/ready` (зависимости) |
 | `TRANSLATION_DEDUP_INFLIGHT_TTL_SECONDS` | `2100` | TTL резерва «в работе» (не равен TTL отметки «готово») |
+| `TRANSLATION_RENDER_ART` | `false` | включить арт-слой фазы 2 (перерисовка страницы) |
+| `TRANSLATION_INPAINT_PROVIDER` | `none` | `none` (страница без изменений) \| `http` \| `fake` (тесты) |
+| `TRANSLATION_INPAINT_URL` | — | URL inpaint-сервиса (обязателен для `http`) |
+| `TRANSLATION_STRICT_RENDER` | `false` | сбой рендера валит страницу `LAYOUT_FAILED` вместо фолбэка на оверлей |
+| `TRANSLATION_TYPESET_QUALITY` | `85` | качество WEBP арт-слоя |
 
 Несогласованные провайдеры ловятся на старте с понятным текстом: `http` без
 `OCR_URL`, `manga` без модели, `LLM` без `LLM_BASE_URL`/`LLM_MODEL`, `DEEPL`
@@ -99,7 +105,7 @@ docker compose -f docker/docker-compose.yml up -d --build translation-worker
 
 ## Проверка
 
-- `pytest -q` — 12 файлов тестов, все на fake-провайдерах: без Kafka, S3, Redis,
+- `pytest -q` — 14 файлов тестов, все на fake-провайдерах: без Kafka, S3, Redis,
   GPU и моделей (`tests/conftest.py`).
 - `ruff check .` — line-length 100, isort, py312.
 - Пробы: `GET /health` → `200 {"status":"UP"}` (liveness, зависимости не
