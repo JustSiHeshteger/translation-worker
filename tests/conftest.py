@@ -39,6 +39,7 @@ class FakeStorage:
 
     objects: dict[str, bytes] = field(default_factory=dict)
     puts: list[str] = field(default_factory=list)
+    content_types: dict[str, str] = field(default_factory=dict)
 
     def get_bytes(self, key: str) -> bytes:
         if key not in self.objects:
@@ -56,6 +57,7 @@ class FakeStorage:
     def put_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream"):
         self.objects[key] = data
         self.puts.append(key)
+        self.content_types[key] = content_type
         return key
 
     def json_at(self, key: str) -> dict:

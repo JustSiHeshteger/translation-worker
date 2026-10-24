@@ -1,9 +1,10 @@
 # =====================================================================
 # translation-worker — образ конвейера автоперевода комиксов (Python 3.12).
 #
-# Фаза 1: OCR/перевод/рендер — инъектируемые провайдеры (fake|http|manga,
-# STUB|LLM|DEEPL), арт-слой не рисуется. ML-стек (torch/manga-ocr) в образ
-# НЕ ставится — он живёт в requirements-ml.txt для GPU-поды/локального запуска.
+# Фаза 1: OCR/перевод — инъектируемые провайдеры (fake|http|manga, STUB|LLM|DEEPL).
+# Фаза 2: арт-слой (inpaint + вёрстка) выключен по умолчанию
+# (`TRANSLATION_RENDER_ART=false`), включает его владелец конфигом. ML-стек
+# (torch/manga-ocr) в образ НЕ ставится — он живёт в requirements-ml.txt.
 #
 # Контекст сборки — КОРЕНЬ монорепо (в образ кладётся asyncapi-контракт
 # событий, источник правды — books-platform-openapi, а не копия в сервисе):
@@ -11,17 +12,23 @@
 # =====================================================================
 FROM python:3.12-slim
 
+# Шрифт вёрстки: без кириллицы в образе перевод рисовался бы квадратиками
+# (Pillow-дефолт не покрывает кириллицу), поэтому DejaVu ставится в образ.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/app/src \
     TRANSLATION_SCHEMA_PATH=/app/schemas/comic-translation-events.yaml \
-    TRANSLATION_HEALTH_PORT=8093
+    TRANSLATION_HEALTH_PORT=8093 \
+    TRANSLATION_FONT_PATH=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
 
 WORKDIR /app
 
-# non-root пользователь сервиса
-RUN groupadd --system svc \
+# non-root пользователь сервиса + шрифт для арт-слоя (кириллица)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system svc \
     && useradd --system --gid svc --home-dir /app --shell /usr/sbin/nologin svc
 
 COPY translation-worker/requirements.txt ./requirements.txt

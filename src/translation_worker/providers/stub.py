@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from translation_worker.models import Layer
-
 PREFIX = "переведено: "
 
 
@@ -33,14 +31,3 @@ class StubTranslator:
         if term:
             return term
         return f"{self.prefix}{text}"
-
-
-@dataclass
-class NullRenderer:
-    """Рендер фазы 1: арт не перерисовывается, страница отдаётся как есть.
-
-    В фазе 2 (карточка 58) на это место встаёт inpaint + вёрстка перевода.
-    """
-
-    async def render(self, image: bytes, layer: Layer) -> bytes:
-        return image
