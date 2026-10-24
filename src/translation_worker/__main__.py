@@ -171,14 +171,14 @@ async def _main() -> int:
 
     # Сбой старта не должен оставлять открытыми уже поднятые клиенты:
     # `finally` основного блока на этот момент ещё не активен.
-    started: list[Any] = []
     try:
         await producer.start()
-        started.append(producer)
         await consumer.start()
-        started.append(consumer)
     except Exception:
-        for client in reversed(started):
+        # `start()` упавшего клиента тоже надо остановить: aiokafka заводит
+        # внутренние задачи ДО подключения, и без `stop()` asyncio пишет
+        # «Unclosed AIOKafkaProducer» на штатном пути недоступного брокера
+        for client in [consumer, producer]:
             with contextlib.suppress(Exception):
                 await client.stop()
         with contextlib.suppress(Exception):
