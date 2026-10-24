@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import json
 
-import pytest
 
 from translation_worker.__main__ import DependencyState, _refresh_redis, _serve_health
 
@@ -147,15 +146,34 @@ def test_dependencies_start_down_until_confirmed() -> None:
     assert DependencyState().payload()["status"] == "DOWN"
 
 
-def test_refresh_redis_does_not_swallow_programming_errors() -> None:
-    """`AttributeError` — поломка кода, а не отказ зависимости: её нельзя глушить."""
+def test_refresh_redis_reports_programming_errors_without_dying(caplog) -> None:
+    """`AttributeError` — поломка кода, а не отказ зависимости: её видно в логе.
+
+    Раньше проба падала целиком, и `/ready` застывал в последнем состоянии —
+    при зелёном флаге это означало «готов» при мёртвой зависимости. Теперь
+    программная ошибка снимает готовность, попадает в лог с трейсбеком, а сам
+    зонд продолжает работать: исчезнувшая задача неотличима от здоровой.
+    """
 
     class _Broken:
         async def ping(self) -> bool:
             raise AttributeError("ping is gone")
 
-    async def scenario() -> None:
-        await _refresh_redis(_Broken(), DependencyState(), interval=0.01)  # type: ignore[arg-type]
+    state = DependencyState(redis=True)
 
-    with pytest.raises(AttributeError):
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            _refresh_redis(_Broken(), state, interval=0.01)  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0.1)
+        assert task.done() is False, "зонд обязан пережить поломку кода"
+        assert state.redis is False, "готовность снимается, а не залипает в True"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    with caplog.at_level("ERROR", logger="translation_worker.__main__"):
         asyncio.run(scenario())
+
+    messages = [record.message for record in caplog.records]
+    assert any("redis" in message for message in messages), "поломка обязана быть в логе"

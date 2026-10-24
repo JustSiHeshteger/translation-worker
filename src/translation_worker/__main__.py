@@ -13,11 +13,14 @@ import contextlib
 import json
 import logging
 import signal
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka.admin import AIOKafkaAdminClient
+from aiokafka.errors import KafkaError
 from aiokafka.structs import ConsumerRecord, TopicPartition
 from redis.asyncio import Redis, from_url
 from redis.exceptions import RedisError
@@ -44,6 +47,15 @@ _READY_REFRESH_SECONDS = 15.0
 # Сколько ждать снятия резерва дедупа при остановке; меньше
 # terminationGracePeriodSeconds в манифесте, чтобы под успел погаситься сам.
 _SHUTDOWN_GRACE_SECONDS = 10.0
+
+# Подключение к брокеру повторяется с нарастающей паузой: под, переживший
+# недоступность Kafka, не должен требовать внешнего рестарта.
+_RECONNECT_MIN_DELAY_SECONDS = 1.0
+_RECONNECT_MAX_DELAY_SECONDS = 30.0
+
+# Интервал зонда готовности брокера: ответ на метаданные подтверждает, что
+# потребление возможно. 5 с — компромисс между честностью /ready и трафиком.
+_BROKER_PROBE_SECONDS = 5.0
 
 # Чанк ожидания чужого резерва: партиция на паузе, остальные продолжают течь.
 _BUSY_WAIT_CHUNK_SECONDS = 15.0
@@ -136,21 +148,6 @@ async def _main() -> int:
         ttl_seconds=settings.dedup_ttl_seconds,
         inflight_ttl_seconds=settings.dedup_inflight_ttl_seconds,
     )
-    producer = AIOKafkaProducer(
-        bootstrap_servers=settings.kafka_bootstrap,
-        # результат задания не должен теряться на стороне брокера: offset
-        # коммитится после публикации, поэтому acks=all + идемпотентность
-        acks="all",
-        enable_idempotence=True,
-    )
-    consumer = AIOKafkaConsumer(
-        settings.requests_topic,
-        bootstrap_servers=settings.kafka_bootstrap,
-        group_id=settings.group_id,
-        enable_auto_commit=False,
-        auto_offset_reset="earliest",
-        max_poll_interval_ms=settings.max_poll_interval_ms,
-    )
     schema_path = _resolve_schema_path(settings.schema_path)
     # fail fast: без читаемого контракта любое задание уходило бы в
     # DLQ SCHEMA_VALIDATION_FAILED при зелёном /health
@@ -161,43 +158,18 @@ async def _main() -> int:
         _contract.component_schema("ComicTranslationRequestedPayload", schema_path)
     except _contract.ContractError as exc:
         raise SystemExit(f"translation-worker: контракт {schema_path} не читается: {exc}") from exc
-    handler = TranslationConsumer(
-        settings,
-        pipeline,
-        KafkaPublisher(producer),
-        dedup=dedup,
-        schema_path=schema_path,
-    )
-
-    # Сбой старта не должен оставлять открытыми уже поднятые клиенты:
-    # `finally` основного блока на этот момент ещё не активен.
-    try:
-        await producer.start()
-        await consumer.start()
-    except Exception:
-        # `start()` упавшего клиента тоже надо остановить: aiokafka заводит
-        # внутренние задачи ДО подключения, и без `stop()` asyncio пишет
-        # «Unclosed AIOKafkaProducer» на штатном пути недоступного брокера
-        for client in [consumer, producer]:
-            with contextlib.suppress(Exception):
-                await client.stop()
-        with contextlib.suppress(Exception):
-            await redis.aclose()
-        raise
     dependencies = DependencyState()
+    producer: AIOKafkaProducer | None = None
+    consumer: AIOKafkaConsumer | None = None
     health: asyncio.AbstractServer | None = None
     tasks: list[asyncio.Task[Any]] = []
     consume_task: asyncio.Task[Any] | None = None
     consume_cancelled = False
     try:
-        # сервер проб поднимается ВНУТРИ защищённого блока: занятый порт
-        # (частый случай рестарта пода) иначе уводил бы из функции с
-        # открытыми Kafka-клиентами и Redis
-        health = await asyncio.start_server(
-            lambda reader, writer: _serve_health(reader, writer, dependencies),
-            host="0.0.0.0",
-            port=settings.health_port,
-        )
+        # пробы поднимаются ДО подключения к Kafka: недоступный брокер — это
+        # «не готов» (503), а не мёртвый под; иначе k8s убивал бы воркер в
+        # цикле рестартов вместо ожидания сети
+        health = await _start_health_server(dependencies, settings.health_port)
         _LOG.info(
             "translation-worker запущен: топик %s, группа %s, провайдеры ocr=%s translate=%s,"
             " порт проб %d",
@@ -207,14 +179,34 @@ async def _main() -> int:
             settings.translate_provider,
             settings.health_port,
         )
+        # ожидание брокера внутри защищённого блока: занятый порт и сигнал
+        # остановки не должны оставлять открытыми Redis и Kafka-клиенты
+        clients = await _connect_clients(
+            lambda: make_producer(settings),
+            lambda: make_consumer(settings),
+            stop=stop,
+        )
+        if clients is None:
+            _LOG.info("остановка получена до подключения к Kafka: выходим без задания")
+            return 0
+        producer, consumer = clients
+        handler = TranslationConsumer(
+            settings,
+            pipeline,
+            KafkaPublisher(producer),
+            dedup=dedup,
+            schema_path=schema_path,
+        )
         consume_task = asyncio.create_task(_consume(consumer, handler, dependencies))
+        broker_task = asyncio.create_task(
+            _watch_broker(lambda: make_admin(settings), dependencies)
+        )
         ready_task = asyncio.create_task(_refresh_redis(redis, dependencies))
         stop_task = asyncio.create_task(stop.wait())
-        tasks = [consume_task, ready_task, stop_task]
+        tasks = [consume_task, broker_task, ready_task, stop_task]
         done, _pending = await asyncio.wait(
             {consume_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
         )
-        dependencies.kafka = False
         if consume_task in done:
             consume_task.result()
             _LOG.error("цикл consume завершился сам — останавливаем сервис")
@@ -243,12 +235,170 @@ async def _main() -> int:
             health.close()
             with contextlib.suppress(Exception):
                 await health.wait_closed()
-        with contextlib.suppress(Exception):
-            await consumer.stop()
-        with contextlib.suppress(Exception):
-            await producer.stop()
+        if consumer is not None:
+            with contextlib.suppress(Exception):
+                await consumer.stop()
+        if producer is not None:
+            with contextlib.suppress(Exception):
+                await producer.stop()
         with contextlib.suppress(Exception):
             await redis.aclose()
+
+
+def make_admin(settings: Settings) -> AIOKafkaAdminClient:
+    """Админ-клиент для зонда готовности: только метаданные, без потребления."""
+    return AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap)
+
+
+def make_producer(settings: Settings) -> AIOKafkaProducer:
+    """Продюсер результатов: acks=all + идемпотентность (задание не теряется)."""
+    return AIOKafkaProducer(
+        bootstrap_servers=settings.kafka_bootstrap,
+        acks="all",
+        enable_idempotence=True,
+    )
+
+
+def make_consumer(settings: Settings) -> AIOKafkaConsumer:
+    """Консьюмер заданий: ручной коммит, чтение с начала без пропусков."""
+    return AIOKafkaConsumer(
+        settings.requests_topic,
+        bootstrap_servers=settings.kafka_bootstrap,
+        group_id=settings.group_id,
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
+        max_poll_interval_ms=settings.max_poll_interval_ms,
+    )
+
+
+async def _connect_clients(
+    producer_factory: Callable[[], AIOKafkaProducer],
+    consumer_factory: Callable[[], AIOKafkaConsumer],
+    *,
+    stop: asyncio.Event,
+    retry_delay: float = _RECONNECT_MIN_DELAY_SECONDS,
+    max_delay: float = _RECONNECT_MAX_DELAY_SECONDS,
+) -> tuple[AIOKafkaProducer, AIOKafkaConsumer] | None:
+    """Подключиться к Kafka с повторами; `None` — пришёл сигнал остановки.
+
+    Недоступный брокер — это «не готов», а не «процесс умер»: пробы уже
+    подняты, `/health` отвечает 200, `/ready` — 503, а подключение повторяется
+    с нарастающей паузой. Клиенты создаются ЗАНОВО на каждую попытку: aiokafka
+    не поддерживает повторный `start()` после неудачного, и переиспользование
+    объекта заклинило бы воркер навсегда.
+    """
+    delay = retry_delay
+    while not stop.is_set():
+        producer = producer_factory()
+        consumer = consumer_factory()
+        attempt = asyncio.create_task(_start_clients(producer, consumer))
+        stopper = asyncio.create_task(stop.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {attempt, stopper}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if attempt not in done:
+                # сигнал пришёл во время попытки: не ждём клиентский таймаут
+                # aiokafka (десятки секунд из grace-бюджета пода)
+                attempt.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await attempt
+                # клиенты прерванной попытки уже созданы: без закрытия они
+                # остались бы «Unclosed AIOKafkaProducer/Consumer», а finally в
+                # _main их не увидит — producer/consumer там ещё None
+                for client in (consumer, producer):
+                    with contextlib.suppress(Exception):
+                        await client.stop()
+                return None
+            attempt.result()
+            return producer, consumer
+        except Exception as exc:  # noqa: BLE001 - любая причина: сеть, DNS, ACL, таймаут
+            for client in (consumer, producer):
+                with contextlib.suppress(Exception):
+                    await client.stop()
+            _LOG.warning(
+                "kafka недоступна (%s: %s): повтор через %.1f с, /health остаётся зелёным,"
+                " /ready отвечает 503",
+                type(exc).__name__,
+                exc,
+                delay,
+            )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            delay = _next_delay(delay, retry_delay=retry_delay, max_delay=max_delay)
+        finally:
+            stopper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stopper
+    return None
+
+
+async def _start_clients(producer: AIOKafkaProducer, consumer: AIOKafkaConsumer) -> None:
+    """Поднять пару клиентов: вынесено, чтобы попытку можно было отменить."""
+    await producer.start()
+    await consumer.start()
+
+
+def _next_delay(delay: float, *, retry_delay: float, max_delay: float) -> float:
+    """Следующая пауза между попытками: удвоение с потолком."""
+    return min(max(delay * 2, retry_delay), max_delay)
+
+
+async def _watch_broker(
+    make_admin: Callable[[], AIOKafkaAdminClient],
+    state: DependencyState,
+    interval: float = _BROKER_PROBE_SECONDS,
+) -> None:
+    """Держать готовность Kafka по фактическому ответу брокера.
+
+    `describe_cluster` — настоящий round-trip к брокеру: он не потребляет
+    записи и не сдвигает оффсеты, поэтому `/ready` зеленеет только после
+    ответа брокера, а не при входе в цикл consume. Пропажа брокера снимает
+    готовность в пределах пары интервалов.
+
+    Админ-клиент переиспользуется между опросами: соединение поднимается один
+    раз, а при обрыве закрывается и создаётся заново. У консьюмера публичного
+    запроса метаданных нет (в aiokafka 0.14 `list_topics` есть только у
+    админ-клиента), поэтому проба живёт на своём соединении.
+    """
+    admin: AIOKafkaAdminClient | None = None
+    while True:
+        try:
+            if admin is None:
+                admin = make_admin()
+                await admin.start()
+            await asyncio.wait_for(admin.describe_cluster(), timeout=max(interval, 1.0))
+            state.kafka = True
+        except (TimeoutError, OSError, KafkaError):
+            state.kafka = False
+            if admin is not None:
+                with contextlib.suppress(Exception):
+                    await admin.close()
+                admin = None
+        except Exception:  # noqa: BLE001 - зонд не имеет права умереть молча
+            # неожидаемая ошибка (баг клиента, несовместимая версия aiokafka):
+            # «не готов» — единственный безопасный ответ, а задача обязана жить
+            # дальше, иначе /ready застынет в последнем состоянии, возможно в 200
+            _LOG.exception("зонд готовности kafka упал: /ready отвечает 503 до восстановления")
+            state.kafka = False
+            if admin is not None:
+                with contextlib.suppress(Exception):
+                    await admin.close()
+                admin = None
+        await asyncio.sleep(interval)
+
+
+async def _start_health_server(state: DependencyState, port: int) -> asyncio.AbstractServer:
+    """Поднять сервер проб; вызывается ДО подключения к Kafka.
+
+    Порядок важен: пока брокер недоступен, k8s должен видеть живую liveness и
+    «не готовую» readiness, иначе под начнут убивать вместо ожидания сети.
+    """
+    return await asyncio.start_server(
+        lambda reader, writer: _serve_health(reader, writer, state),
+        host="0.0.0.0",
+        port=port,
+    )
 
 
 async def _consume(
@@ -263,8 +413,6 @@ async def _consume(
     (таймаут + ограниченные повторы + WARN-продолжение). Запись, которую
     обработать не удалось, остаётся незакоммиченной и будет доставлена снова.
     """
-    if state is not None:
-        state.kafka = True
     try:
         await _consume_loop(consumer, handler)
     except _BusyUnresolved:
@@ -365,9 +513,11 @@ async def _consume_loop(consumer: AIOKafkaConsumer, handler: TranslationConsumer
                 exc_info=True,
             )
             continue
-        # успешная запись снимает свою историю повторов: иначе модульный
-        # счётчик растёт на долгоживущем поде
-        _retries.pop((TopicPartition(record.topic, record.partition), record.offset), None)
+        # успешная запись снимает свою историю повторов и ожиданий: иначе
+        # модульные словари растут на долгоживущем поде
+        key = (TopicPartition(record.topic, record.partition), record.offset)
+        _retries.pop(key, None)
+        _busy_wait.pop(key, None)
         _LOG.debug(
             "запись %s/%s@%d: %s, топики: %s",
             record.topic,
@@ -464,8 +614,13 @@ async def _refresh_redis(
             await asyncio.wait_for(redis.ping(), timeout=5)
             state.redis = True
         except (TimeoutError, OSError, RedisError):
-            # недоступность Redis — «не готов»; программные ошибки (AttributeError)
-            # не глушим, иначе поломка кода выглядела бы как падение зависимости
+            # недоступность Redis — «не готов»
+            state.redis = False
+        except Exception:  # noqa: BLE001 - зонд не имеет права умереть молча
+            # программная ошибка (например, несовместимый клиент) не должна
+            # оставлять /ready в последнем состоянии: «не готов» + лог, и жить
+            # дальше — иначе дефект кода выглядел бы как зелёная готовность
+            _LOG.exception("зонд готовности redis упал: /ready отвечает 503 до восстановления")
             state.redis = False
         await asyncio.sleep(interval)
 
