@@ -105,17 +105,41 @@ docker compose -f docker/docker-compose.yml up -d --build translation-worker
 
 ## Проверка
 
-- `pytest -q` — 14 файлов тестов, все на fake-провайдерах: без Kafka, S3, Redis,
+- `pytest -q` — 16 файлов тестов, все на fake-провайдерах: без Kafka, S3, Redis,
   GPU и моделей (`tests/conftest.py`).
 - `ruff check .` — line-length 100, isort, py312.
 - Пробы: `GET /health` → `200 {"status":"UP"}` (liveness, зависимости не
   проверяет — рестарт живого воркера не помогает), `GET /ready` → `200` с
   `dependencies` либо `503 {"status":"DOWN","dependencies":{"kafka":"down"}}`.
-  Kafka-флаг ведёт цикл consume, Redis пингуется фоном раз в 15 с.
+- Старт с гейтом по готовности: недоступный брокер — это «не готов», а не
+  «процесс умер». Пробы поднимаются ДО подключения, `/health` отвечает 200,
+  `/ready` — 503, подключение повторяется с backoff 1→30 с, а потребление
+  стартует после успеха. Флаг `kafka` подтверждается зондом `AIOKafkaAdminClient.describe_cluster()`
+  (реальный round-trip, не потребляющий записи) раз в 5 с; Redis пингуется
+  раз в 15 с. Фатально только нечитаемый контракт событий: он лечится не
+  рестартом, а другим образом.
 
-## Ограничения фазы 1
+## Стендовая проверка арт-слоя
 
-- Арт-слой не перерисовывается: `layer.json` — оверлей, `imageKey` = `null`.
+`scripts/stand_art_check.py` прогоняет настоящую книгу через compose-стек:
+логинится (или регистрирует) автора, создаёт книгу в `book-service`, загружает
+CBZ через `upload-service`, заказывает перевод, ждёт `ComicTranslationCompleted`
+и проверяет у слоя страницы `imageUrl`, формат WEBP, неизменный размер страницы,
+нарисованный перевод в рамках реплик и нетронутую страницу вне реплик.
+Нужен поднятый `docker compose` (`inpaint-service` + `translation-worker`).
+Роль `AUTHOR` на dev-стенде выдаётся один раз вручную — команду печатает сам
+скрипт (в auth_db нет сидов администратора, в проде роль выдаёт admin-service).
+
+```bash
+cd docker; docker compose --env-file .env up -d --build
+cd ..; translation-worker\.venv\Scripts\python.exe translation-worker\scripts\stand_art_check.py
+```
+
+## Ограничения
+
+- По умолчанию арт-слой выключен (`TRANSLATION_RENDER_ART=false`): `layer.json` —
+  оверлей, `imageKey` = `null`. В compose и k8s он включён и работает через
+  `inpaint-service`.
 - `kind` у всех блоков `BUBBLE`; SFX отдельной политикой не выделяются (D-008).
 - `manga-ocr` возвращает текст всей страницы без рамок — боксы баблов даёт
   внешний OCR-сервис (`TRANSLATION_OCR_PROVIDER=http`); ML-стек в образ не входит.
