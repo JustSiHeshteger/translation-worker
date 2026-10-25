@@ -20,7 +20,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src \
     TRANSLATION_SCHEMA_PATH=/app/schemas/comic-translation-events.yaml \
     TRANSLATION_HEALTH_PORT=8093 \
-    TRANSLATION_FONT_PATH=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+    TRANSLATION_FONT_PATH=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
 
 WORKDIR /app
 

@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    # Таймаут одного запроса к LLM: локальная модель на CPU переводит страницу
+    # заметно дольше минуты, а жёсткая константа превращала бы корректный
+    # прогон в TRANSLATION_FAILED. Дефолт — под облачные API. Верхняя граница
+    # оставляет запас на repair-запрос и повторы внутри общего таймаута задания.
+    llm_timeout: float = Field(default=60.0, gt=0, le=600.0)
     deepl_api_key: str = ""
     translate_provider: TranslateProviderName = "STUB"
 

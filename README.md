@@ -64,6 +64,7 @@ translated/{bookId}/{language}/page/{nnn}/web.webp        # фаза 2 (карт
 | `TRANSLATION_MANGA_MODEL` | `kha-white/manga-ocr-base` | модель manga-ocr (для `manga`) |
 | `TRANSLATION_TRANSLATE_PROVIDER` | `STUB` | `STUB` \| `LLM` \| `DEEPL` |
 | `TRANSLATION_LLM_BASE_URL` / `_LLM_MODEL` / `_LLM_API_KEY` | — | OpenAI-совместимый endpoint |
+| `TRANSLATION_LLM_TIMEOUT` | `60` | таймаут одного запроса к LLM, секунды (≤ 600); локальная модель на CPU переводит страницу дольше минуты, поэтому на стенде `180` |
 | `TRANSLATION_DEEPL_API_KEY` | — | ключ DeepL |
 | `TRANSLATION_MAX_RETRIES` | `2` | ретраев до DLQ |
 | `TRANSLATION_TIMEOUT` | `1800` (30 мин) | таймаут задания, секунды |
