@@ -28,15 +28,13 @@ LINE_SPACING = 1.2
 #: Отступ текста внутри плашки, px.
 PADDING = 4
 
-#: Ширина обводки плашки, px (карточка 58 §2.2).
-OUTLINE_WIDTH = 2
-
 #: Радиус скругления плашки, px.
 PLAQUE_RADIUS = 10
 
-#: Цвета плашки: белая заливка, чёрная обводка, чёрный текст.
+#: Цвета плашки: белая заливка без обводки, чёрный текст. Обводки нет намеренно:
+#: балун на странице уже обведён автором, и вторая линия вокруг перевода читается
+#: как двойной блок.
 PLAQUE_FILL = (255, 255, 255)
-PLAQUE_OUTLINE = (0, 0, 0)
 TEXT_COLOR = (0, 0, 0)
 
 #: Функция измерения: (текст, кегль) → ширина в пикселях.
@@ -167,7 +165,7 @@ def pillow_measure(font_path: str = "") -> MeasureText:
 
 
 class Typesetter:
-    """Рисование плашек и текста поверх заинпанченной страницы (WEBP)."""
+    """Рисование белых плашек и текста поверх заинпанченной страницы (WEBP)."""
 
     def __init__(self, quality: int = 85, font_path: str = "") -> None:
         self._quality = quality
@@ -198,8 +196,6 @@ class Typesetter:
             [box.x, box.y, box.x + box.w - 1, box.y + box.h - 1],
             radius=min(PLAQUE_RADIUS, box.w // 2, box.h // 2),
             fill=PLAQUE_FILL,
-            outline=PLAQUE_OUTLINE,
-            width=OUTLINE_WIDTH,
         )
         font = _font(self._font_path, item.font_size)
         line_height = item.font_size * LINE_SPACING
@@ -216,10 +212,8 @@ class Typesetter:
 
 __all__ = [
     "MIN_FONT_SIZE",
-    "OUTLINE_WIDTH",
     "PADDING",
     "PLAQUE_FILL",
-    "PLAQUE_OUTLINE",
     "TEXT_COLOR",
     "MeasureText",
     "PlacedText",

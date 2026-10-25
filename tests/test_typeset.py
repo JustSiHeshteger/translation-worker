@@ -172,6 +172,60 @@ def test_render_paints_plaque_inside_the_box_only(page_png) -> None:
             if not (box.x - 2 <= x <= box.x + box.w + 1 and box.y - 2 <= y <= box.y + box.h + 1)
         }
 
-    assert dark_inside > 0, "текст и обводка плашки обязаны дать непустые пиксели"
-    assert corner_inside == (255, 255, 255), "внутри плашки белая заливка, а не фон"
+    assert dark_inside > 0, "текст плашки обязан дать непустые тёмные пиксели"
+    # WEBP сжимает с потерями: белизна проверяется с допуском, а не побайтно
+    assert all(channel >= 248 for channel in corner_inside), (
+        f"внутри плашки белая заливка, а не фон: {corner_inside}"
+    )
     assert outside == {(200, 200, 200)}, "вне бокса страница не меняется"
+
+
+def _drift(pixel: tuple[int, int, int], background: int) -> int:
+    """Насколько пиксель ушёл от фона страницы (по самому «уехавшему» каналу)."""
+    return max(abs(channel - background) for channel in pixel)
+
+
+def test_plaque_has_no_border_line(page_png) -> None:
+    """Плашка без обводки: в балуне не появляется второй рамки.
+
+    Балун уже обведён автором страницы; чёрная кайма вокруг перевода читается
+    как двойной блок, поэтому подложка остаётся белой и без линии по периметру.
+    Замер идёт по всем четырём сторонам бокса и по пикселям на 1 px снаружи:
+    обводку, нарисованную наружу, иначе проверка пропустила бы.
+    """
+    page = page_png(400, 300, color=(200, 200, 200))
+    box = Box(x=20, y=20, w=300, h=120)
+
+    rendered = Typesetter().render(page, [block("Привет", box)])
+
+    with Image.open(io.BytesIO(rendered)) as picture:
+        pixels = picture.convert("RGB")
+        # радиус скругления 10 px пропускаем, чтобы не мерить фон за углами
+        xs = range(box.x + 12, box.x + box.w - 12, 7)
+        ys = range(box.y + 12, box.y + box.h - 12, 7)
+        edge = [pixels.getpixel((x, box.y)) for x in xs]
+        edge += [pixels.getpixel((x, box.y + box.h - 1)) for x in xs]
+        edge += [pixels.getpixel((box.x, y)) for y in ys]
+        edge += [pixels.getpixel((box.x + box.w - 1, y)) for y in ys]
+        # кольцо снаружи: только длинные стороны, подальше от скруглений
+        outer_xs = range(box.x + 16, box.x + box.w - 16, 7)
+        outer_ys = range(box.y + 16, box.y + box.h - 16, 7)
+        ring = [pixels.getpixel((x, box.y - 1)) for x in outer_xs]
+        ring += [pixels.getpixel((x, box.y + box.h)) for x in outer_xs]
+        ring += [pixels.getpixel((box.x - 1, y)) for y in outer_ys]
+        ring += [pixels.getpixel((box.x + box.w, y)) for y in outer_ys]
+
+    background = 200
+    # WEBP сжимает с потерями: у самой рамки фон может уехать на пару единиц,
+    # поэтому «линия снаружи» — это заметное отклонение, а не любой не-200
+    tolerance = 16
+    assert all(sum(pixel) > 3 * 240 for pixel in edge), (
+        f"по периметру плашки не должно быть линии, тёмные точки: "
+        f"{[pixel for pixel in edge if sum(pixel) <= 3 * 240][:4]}"
+    )
+    assert all(
+        abs(channel - background) <= tolerance for pixel in ring for channel in pixel
+    ), (
+        f"обводка не должна выходить за рамку, отклонение больше {tolerance}: "
+        f"{[pixel for pixel in ring if _drift(pixel, background) > tolerance][:4]}"
+    )
