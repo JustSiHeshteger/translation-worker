@@ -52,7 +52,7 @@ class Translator(Protocol):
 
 @runtime_checkable
 class BatchTranslator(Protocol):
-    """Перевод страницы одним запросом (LLM/DeepL): дешевле и точнее по контексту."""
+    """Перевод страницы пачкой реплик (LLM/DeepL): дешевле и точнее по контексту."""
 
     async def translate_page(
         self,
