@@ -17,6 +17,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 OcrProviderName = Literal["fake", "http", "manga"]
 TranslateProviderName = Literal["LLM", "DEEPL", "STUB"]
 InpaintProviderName = Literal["none", "http", "fake"]
+LlmApiMode = Literal["openai", "ollama"]
+
+
 
 
 class Settings(BaseSettings):
@@ -52,6 +55,14 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
+    #: Протокол общения с моделью. `openai` — OpenAI-совместимый слой
+    #: (`/v1/chat/completions`), он подходит облачным API и обычным моделям.
+    #: `ollama` — родной `/api/chat` с `think=false`: reasoning-модели в
+    #: OpenAI-слое тратят весь бюджет на размышления и отдают пустой `content`.
+    llm_api_mode: LlmApiMode = "openai"
+    #: Попыток на один запрос к LLM: временный 500 от локальной модели лечится
+    #: повтором, а не падением страницы (у облачных API хватает и одной).
+    llm_retries: int = Field(default=1, ge=0, le=10)
     # Таймаут одного запроса к LLM: локальная модель на CPU переводит страницу
     # заметно дольше минуты, а жёсткая константа превращала бы корректный
     # прогон в TRANSLATION_FAILED. Дефолт — под облачные API. Верхняя граница
@@ -114,6 +125,9 @@ class Settings(BaseSettings):
                 "TRANSLATION_TRANSLATE_PROVIDER=LLM требует TRANSLATION_LLM_BASE_URL "
                 "и TRANSLATION_LLM_MODEL"
             )
+        # Значение `llm_api_mode` проверяет сам тип `LlmApiMode` (Literal):
+        # опечатка в TRANSLATION_LLM_API_MODE роняет старт с перечнем допустимых
+        # значений, и перевод не уезжает молча в другой протокол.
         if self.translate_provider == "DEEPL" and not self.deepl_api_key:
             raise ValueError(
                 "TRANSLATION_TRANSLATE_PROVIDER=DEEPL требует TRANSLATION_DEEPL_API_KEY"

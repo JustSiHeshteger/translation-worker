@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +28,13 @@ _LOG = logging.getLogger(__name__)
 _SYSTEM_PROMPT = (
     "Ты переводишь реплики комикса с языка «{source}» на язык «{target}». "
     "Стиль: короткие живые реплики, без пояснений, сносок и транслитерации. "
+    # Длина реплики решает вёрстку: длинный текст вынуждает мелкий кегль и
+    # лишние строки в плашке. Короткий синоним — не вольность, а требование,
+    # но смысл, имена и глоссарий важнее: реплику нельзя сокращать за их счёт.
+    "Выбирай короткие слова: если у слова или оборота есть короткий синоним, "
+    "подходящий по смыслу, переводи им («осуществлять» → «делать», "
+    "«чрезвычайное совещание» → «срочный сбор»); смысл, имена и термины "
+    "глоссария важнее длины — реплику не сокращай и не выбрасывай. "
     "Глоссарий (переводи термины дословно): {glossary}. "
     "На каждый входной id верни ровно один перевод. "
     'Ответ — только JSON: {{"blocks": [{{"id": "0", "text": "..."}}]}}.'
@@ -69,6 +78,9 @@ class LlmTranslator:
     api_key: str = ""
     timeout: float = 60.0
     retries: int = 1
+    #: Протокол разговора с моделью: `openai` — слой `/v1/chat/completions`,
+    #: `ollama` — родной `/api/chat` с выключенными размышлениями.
+    api_mode: str = "openai"
 
     async def translate(
         self,
@@ -186,7 +198,7 @@ class LlmTranslator:
             ensure_ascii=False,
         )
         expected = {str(index) for index in range(len(texts))}
-        mapped = _parse_blocks(await self._chat(system, user, blocks=len(texts)))
+        mapped = _translated_only(await self._chat(system, user, blocks=len(texts)))
         # Пустой ответ — обрыв стрима на потолке: repair-запрос вернёт то же самое,
         # а дробить надо сразу, пока не истрачен бюджет времени.
         if not mapped:
@@ -201,7 +213,7 @@ class LlmTranslator:
                 f"{', '.join(sorted(expected))}."
             )
             mapped = _without_surplus(
-                _parse_blocks(await self._chat(repair, user, blocks=len(texts))), expected
+                _translated_only(await self._chat(repair, user, blocks=len(texts))), expected
             )
         missing = sorted(expected - set(mapped))
         if missing:
@@ -212,16 +224,30 @@ class LlmTranslator:
         return [mapped[str(index)] for index in range(len(texts))]
 
     async def _chat(self, system: str, user: str, *, blocks: int) -> str:
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        """Запрос к модели в выбранном протоколе.
+
+        `ollama` нужен reasoning-моделям: в OpenAI-слое их размышления уходят в
+        отдельное поле и съедают потолок ответа, поэтому `content` приходит
+        пустым. Родной эндпоинт с `think=false` отвечает тем же JSON, но сразу.
+        """
+        ceiling = _TOKENS_FRAME + _TOKENS_PER_BLOCK * blocks
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.api_mode == "ollama":
+            return await self._post(
+                _native_url(self.base_url),
+                headers,
+                _native_body(self.model, system, user, ceiling),
+                parse=_answer_native,
+            )
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
         body: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
             "response_format": {"type": "json_object"},
             # потолок ответа: без него локальная модель генерирует до таймаута
-            "max_tokens": _TOKENS_FRAME + _TOKENS_PER_BLOCK * blocks,
+            "max_tokens": ceiling,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -234,14 +260,29 @@ class LlmTranslator:
             body.pop("response_format", None)
             return await self._post(url, headers, body)
 
-    async def _post(self, url: str, headers: dict[str, str], body: dict[str, Any]) -> str:
+    async def _post(
+        self,
+        url: str,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        *,
+        parse: Callable[[Any], str] | None = None,
+    ) -> str:
+        # по умолчанию — разбор ответа OpenAI-слоя; родной режим передаёт свой
+        answer = parse or _answer_text
         last_error: TranslationError | None = None
-        for _attempt in range(self.retries + 1):
+        for attempt in range(self.retries + 1):
+            if attempt:
+                # локальная модель отдаёт 500, пока грузит веса: без паузы
+                # повтор упирается в то же состояние
+                await asyncio.sleep(_RETRY_BACKOFF_SECONDS)
             try:
                 async with httpx.AsyncClient(timeout=self.timeout) as client:
                     response = await client.post(url, json=body, headers=headers)
             except httpx.HTTPError as exc:
                 last_error = TranslationError(f"LLM недоступен: {exc}")
+                if attempt < self.retries:
+                    _LOG.warning("%s — повтор %d/%d", last_error, attempt + 1, self.retries)
                 continue
             if response.status_code in (400, 422) and "response_format" in body:
                 # 400 приходит и от переполнения контекста: отличаем по телу
@@ -249,10 +290,15 @@ class LlmTranslator:
                 if _rejects_response_format(response.text):
                     raise _UnsupportedFormatError("response_format не поддерживается")
             if not 200 <= response.status_code < 300:
-                last_error = TranslationError(f"LLM ответил HTTP {response.status_code}")
+                # тело ответа в тексте ошибки: иначе причина 500 неизвестна
+                last_error = TranslationError(
+                    f"LLM ответил HTTP {response.status_code}: {_short_body(response.text)}"
+                )
+                if attempt < self.retries:
+                    _LOG.warning("%s — повтор %d/%d", last_error, attempt + 1, self.retries)
                 continue
             try:
-                return _answer_text(response.json())
+                return answer(response.json())
             except ValueError as exc:
                 last_error = TranslationError(f"LLM: некорректный ответ: {exc}")
         raise last_error or TranslationError("LLM: пустой ответ")
@@ -293,11 +339,77 @@ def _without_surplus(mapped: dict[str, str], expected: set[str]) -> dict[str, st
     return mapped
 
 
+#: Пауза перед повтором запроса к LLM: временный отказ провайдера (500 при
+#: загрузке весов, обрыв соединения) проходит за секунды.
+_RETRY_BACKOFF_SECONDS = 1.5
+
+
+
+def _short_body(text: str) -> str:
+    """Тело ответа провайдера короткой строкой для сообщения об ошибке."""
+    compact = " ".join((text or "").split())
+    return compact[:200] or "пустое тело"
+
+def _native_url(base_url: str) -> str:
+    """Адрес родного эндпоинта ollama из настроенного базового URL.
+
+    В конфиге база задана как OpenAI-слой (`.../v1`), поэтому хвост `/v1`
+    отбрасывается: `/api/chat` живёт рядом с ним, а не под ним.
+    """
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/api/chat"
+
+
+def _native_body(model: str, system: str, user: str, ceiling: int) -> dict[str, Any]:
+    """Тело запроса родного API: без размышлений, сразу JSON, свой потолок.
+
+    `think=false` — главное: без него reasoning-модель тратит весь бюджет на
+    размышления и отдаёт пустой `content`. `format=json` заменяет
+    `response_format` OpenAI-слоя, `num_predict` — `max_tokens`.
+    """
+    return {
+        "model": model,
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "options": {"temperature": 0, "num_predict": ceiling},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+
+
+def _answer_native(payload: Any) -> str:
+    """Текст ответа родного API: `message.content` вместо `choices[0]…`."""
+    try:
+        return str(payload["message"]["content"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"нет message.content: {exc}") from exc
+
+
 def _answer_text(payload: Any) -> str:
     try:
         return str(payload["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError(f"нет choices[0].message.content: {exc}") from exc
+
+
+def _translated_only(answer: str) -> dict[str, str]:
+    """Разобрать ответ и выбросить пустые переводы.
+
+    Модель иногда возвращает пару `id → ""`: реплика «переведена» формально, но
+    текста нет. Если принять пустышку за перевод, плашка исчезнет со страницы
+    молча (вёрстка отбрасывает пустые блоки без предупреждения). Пустое значение
+    считается отсутствующим id — и лечится тем же repair/дроблением.
+    """
+    return {
+        identifier: text
+        for identifier, text in _parse_blocks(answer).items()
+        if text.strip()
+    }
 
 
 def _parse_blocks(answer: str) -> dict[str, str]:

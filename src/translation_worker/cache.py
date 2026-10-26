@@ -20,9 +20,20 @@ _LOG = logging.getLogger(__name__)
 
 _CACHE_VERSION = 1
 
+#: Версия стиля перевода. Ключ кэша не знает про промпт, поэтому запись несёт
+#: версию стиля, которым сделана: после правки промпта («короткие синонимы»)
+#: старые записи обязаны промахиваться, иначе книга молча остаётся с прежним
+#: текстом. Меняйте при любой правке промпта или требований к стилю.
+_STYLE_VERSION = 2
+
 
 class TranslationCache:
     """Кэш готовых блоков страницы (после перевода и вёрстки)."""
+
+    @property
+    def style_version(self) -> int:
+        """Версия стиля перевода, которой помечаются записи кэша."""
+        return _STYLE_VERSION
 
     def __init__(self, storage: Storage, settings: Settings) -> None:
         # Облачные тесты создают кэш двумя порядками аргументов: кэш-тесты —
@@ -48,6 +59,11 @@ class TranslationCache:
             if int(payload.get("version", 0)) != _CACHE_VERSION:
                 _LOG.warning("кэш перевода другой версии, промах: %s", key)
                 return None
+            if int(payload.get("style", 0)) != _STYLE_VERSION:
+                # перевод сделан другим промптом: текст устарел, страницу надо
+                # перевести заново, иначе правка стиля не доедет до читателя
+                _LOG.info("кэш перевода другого стиля, промах: %s", key)
+                return None
             blocks = [TextBlock.from_json(item) for item in payload["blocks"]]
         except (AttributeError, KeyError, TypeError, ValueError):
             _LOG.warning("кэш перевода повреждён, промах: %s", key)
@@ -61,6 +77,7 @@ class TranslationCache:
         """Положить блоки страницы в кэш (после успешного перевода и вёрстки)."""
         payload = {
             "version": _CACHE_VERSION,
+            "style": _STYLE_VERSION,
             "blocks": [{**block.to_json(), "id": ""} for block in blocks],
         }
         self._storage.put_json(key, payload)
