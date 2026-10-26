@@ -80,7 +80,9 @@ def test_word_longer_than_line_is_split_to_fit() -> None:
         assert mono(line, placed[0].font_size) <= box.w - 2 * PADDING, (
             "слово без пробелов обязано резаться по символам, иначе текст уезжает за бокс"
         )
-    assert "".join(placed[0].lines) == word, "символы при нарезке не теряются"
+    # дефис — знак переноса, а не потерянный символ: снимаем только концевой
+    restored = "".join(line.removesuffix("-") for line in placed[0].lines)
+    assert restored == word, "символы при нарезке не теряются"
 
 
 def test_font_shrinks_for_low_wide_box() -> None:
