@@ -81,6 +81,8 @@ def build_translator(settings: Settings) -> Translator:
             model=settings.llm_model,
             api_key=settings.llm_api_key,
             timeout=settings.llm_timeout,
+            api_mode=settings.llm_api_mode,
+            retries=settings.llm_retries,
         )
     if settings.translate_provider == "DEEPL":
         return DeepLTranslator(settings.deepl_api_key)

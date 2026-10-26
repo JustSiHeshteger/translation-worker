@@ -64,6 +64,8 @@ translated/{bookId}/{language}/page/{nnn}/web.webp        # фаза 2 (карт
 | `TRANSLATION_MANGA_MODEL` | `kha-white/manga-ocr-base` | модель manga-ocr (для `manga`) |
 | `TRANSLATION_TRANSLATE_PROVIDER` | `STUB` | `STUB` \| `LLM` \| `DEEPL` |
 | `TRANSLATION_LLM_BASE_URL` / `_LLM_MODEL` / `_LLM_API_KEY` | — | OpenAI-совместимый endpoint |
+| `TRANSLATION_LLM_API_MODE` | `openai` | `openai` — слой `/v1/chat/completions`; `ollama` — родной `/api/chat` с `think=false` (reasoning-модели в OpenAI-слое тратят бюджет на размышления и отдают пустой `content`) |
+| `TRANSLATION_LLM_RETRIES` | `1` | попыток на один запрос к LLM (≤ 10); между попытками пауза 1.5 с — локальная ollama изредка отвечает 500, пока грузит веса. Худшее время пачки = `(RETRIES+1) × LLM_TIMEOUT`, держите его внутри `TRANSLATION_TIMEOUT` |
 | `TRANSLATION_LLM_TIMEOUT` | `60` | таймаут одного запроса к LLM, секунды (≤ 600); локальная модель на CPU переводит страницу дольше минуты, поэтому на стенде `180` |
 | `TRANSLATION_DEEPL_API_KEY` | — | ключ DeepL |
 | `TRANSLATION_MAX_RETRIES` | `2` | ретраев до DLQ |
