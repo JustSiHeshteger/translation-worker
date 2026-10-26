@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -66,6 +67,15 @@ class _ContentFailure(TranslationError):
     Транспортные и постоянные ошибки (`LLM недоступен`, HTTP 5xx) сюда не
     попадают: делить пачку на них бессмысленно и дорого — каждый полузапрос
     снова ждёт полный таймаут.
+    """
+
+
+class _GenerationAborted(TranslationError):
+    """Сервер прервал генерацию: модель зациклилась на повторе токенов.
+
+    Ollama отвечает на это HTTP 500 с телом `token repeat limit reached`. Тот же
+    запрос даст тот же результат, поэтому повторы не тратятся: лечится
+    дроблением пачки, а одиночная реплика остаётся оригиналом с предупреждением.
     """
 
 
@@ -122,6 +132,18 @@ class LlmTranslator:
                     offset=start,
                 )
             )
+        leftovers = [
+            index + 1
+            for index, (source_text, text) in enumerate(zip(texts, translated, strict=True))
+            if _untranslated(source_text, text, target)
+        ]
+        if leftovers:
+            # одна сводка на страницу: по ней в логе прогона видно, что страница
+            # ушла читателю частично на исходном языке (COMPLETED этого не скажет)
+            _LOG.warning(
+                "страница переведена не полностью: реплики %s остались оригиналом",
+                ", ".join(str(number) for number in leftovers),
+            )
         return translated
 
     async def _translate_batch(
@@ -148,6 +170,32 @@ class LlmTranslator:
             return await self._translate_chunk(
                 texts, source=source, target=target, glossary=glossary, offset=offset
             )
+        except _GenerationAborted:
+            if len(texts) == 1:
+                # модель зацикливается на единственной реплике: оригинал дешевле,
+                # чем упавшая страница и недоделанная книга
+                _LOG.warning(
+                    "LLM зациклился на единственной реплике %r — оставляю оригинал",
+                    texts[0][:80],
+                )
+                return [texts[0]]
+            _LOG.warning(
+                "LLM прервал генерацию на пачке из %d реплик (с %d) — повторяю половинами",
+                len(texts),
+                offset,
+            )
+            middle = len(texts) // 2
+            head = await self._translate_batch(
+                texts[:middle], source=source, target=target, glossary=glossary, offset=offset
+            )
+            tail = await self._translate_batch(
+                texts[middle:],
+                source=source,
+                target=target,
+                glossary=glossary,
+                offset=offset + middle,
+            )
+            return head + tail
         except _ContentFailure:
             if len(texts) == 1:
                 raise
@@ -198,25 +246,52 @@ class LlmTranslator:
             ensure_ascii=False,
         )
         expected = {str(index) for index in range(len(texts))}
-        mapped = _translated_only(await self._chat(system, user, blocks=len(texts)))
+        parsed = _translated_only(await self._chat(system, user, blocks=len(texts)))
         # Пустой ответ — обрыв стрима на потолке: repair-запрос вернёт то же самое,
         # а дробить надо сразу, пока не истрачен бюджет времени.
-        if not mapped:
+        if not parsed:
             raise _ContentFailure(
                 f"LLM вернул пустой ответ на реплики {_span(offset, len(texts))}"
             )
-        mapped = _without_surplus(mapped, expected)
+        mapped = _without_surplus(parsed, expected)
+        mapped, echoes = _without_echoes(mapped, texts, target)
+        echoed = bool(echoes)
+        if echoes:
+            # исходный текст вместо перевода: id на месте, но перевода нет
+            _LOG.warning(
+                "LLM вернул исходный текст для реплик %s — repair-запрос",
+                _page_numbers(offset, echoes),
+            )
         if set(mapped) != expected:
-            _LOG.warning("LLM вернул не тот набор id (%s) — repair-запрос", sorted(mapped))
+            _LOG.warning(
+                "LLM ответил без переводов для реплик %s — repair-запрос",
+                _page_numbers(offset, sorted(expected - set(mapped))),
+            )
             repair = (
                 f"{system} В ответе были id {sorted(mapped)}; нужны ровно id "
-                f"{', '.join(sorted(expected))}."
+                f"{', '.join(sorted(expected))}. Переведи каждую реплику на язык "
+                f"«{target}»: исходный текст в ответе недопустим."
             )
             mapped = _without_surplus(
                 _translated_only(await self._chat(repair, user, blocks=len(texts))), expected
             )
+            mapped, echoes = _without_echoes(mapped, texts, target)
+            echoed = echoed or bool(echoes)
+            if echoes:
+                _LOG.warning(
+                    "LLM снова вернул исходный текст для реплик %s",
+                    _page_numbers(offset, echoes),
+                )
         missing = sorted(expected - set(mapped))
         if missing:
+            if len(texts) == 1 and echoed:
+                # единственная реплика вернулась исходником: оставить как есть
+                # дешевле, чем уронить страницу, а с ней и всю книгу
+                _LOG.warning(
+                    "LLM не перевёл единственную реплику %r — оставляю оригинал",
+                    texts[0][:80],
+                )
+                return [texts[0]]
             raise _ContentFailure(
                 f"LLM не перевёл реплики {_span(offset, len(texts))} "
                 f"(без перевода: {', '.join(missing)})"
@@ -290,6 +365,11 @@ class LlmTranslator:
                 if _rejects_response_format(response.text):
                     raise _UnsupportedFormatError("response_format не поддерживается")
             if not 200 <= response.status_code < 300:
+                if _is_repeat_abort(response.text):
+                    # цикл на повторе токенов: тот же запрос бессмыслен, дробим
+                    raise _GenerationAborted(
+                        f"LLM прервал генерацию на повторе токенов: {_short_body(response.text)}"
+                    )
                 # тело ответа в тексте ошибки: иначе причина 500 неизвестна
                 last_error = TranslationError(
                     f"LLM ответил HTTP {response.status_code}: {_short_body(response.text)}"
@@ -302,6 +382,20 @@ class LlmTranslator:
             except ValueError as exc:
                 last_error = TranslationError(f"LLM: некорректный ответ: {exc}")
         raise last_error or TranslationError("LLM: пустой ответ")
+
+
+#: Признак того, что сервер прервал генерацию из-за зацикливания на повторах.
+_REPEAT_ABORTS = ("repeat limit", "token repeat")
+
+
+def _is_repeat_abort(body: str) -> bool:
+    """Ответ сервера говорит, что генерацию прервал лимит повторов токенов."""
+    text = (body or "").lower()
+    return any(marker in text for marker in _REPEAT_ABORTS)
+
+def _page_numbers(offset: int, identifiers: list[str]) -> str:
+    """Номера конкретных реплик страницы для сообщений об ошибке."""
+    return ", ".join(str(offset + int(identifier) + 1) for identifier in identifiers)
 
 
 def _span(offset: int, count: int) -> str:
@@ -396,6 +490,55 @@ def _answer_text(payload: Any) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         raise ValueError(f"нет choices[0].message.content: {exc}") from exc
 
+
+#: Письмо целевого языка: если перевода нет ни одного его символа, модель,
+#: скорее всего, вернула исходный текст (эхо), а не перевод.
+#: Набор языков намеренно короткий: для языка вне таблицы эхо ловится только
+#: дословным совпадением с источником. Новый язык чтения — добавьте строку.
+_TARGET_SCRIPTS = {
+    "ru": re.compile("[А-Яа-яЁё]"),
+    "uk": re.compile("[А-Яа-яІіЇїЄєҐґ]"),
+    "bg": re.compile("[А-Яа-яЁё]"),
+    "sr": re.compile("[А-Яа-яЂђЈјЉљЊњЋћЏџ]"),
+}
+_SOURCE_LETTERS = re.compile("[A-Za-z]")
+_ANY_LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
+
+#: Сколько букв в исходной реплике нужно, чтобы считать эхо полноценной фразой.
+#: Ниже порога реплика — имя, логотип, номер или стилизованный звук: их не
+#: переводят, и лишний repair на них только тратит бюджет времени.
+_MIN_ECHO_LETTERS = 12
+
+
+def _untranslated(source: str, translated: str, target: str) -> bool:
+    """Перевод остался исходным текстом (эхо модели), а не переводом.
+
+    Проверка намеренно осторожная: короткие имена («X-MEN»), номера и строки
+    без букв эхом не считаются — их и не должно переводить.
+    """
+    if not translated.strip() or not source.strip():
+        return False
+    if len(_ANY_LETTER.findall(source)) < _MIN_ECHO_LETTERS:
+        return False
+    if translated.strip().lower() == source.strip().lower():
+        return True
+    script = _TARGET_SCRIPTS.get((target or "").strip().lower()[:2])
+    if script is None or script.search(translated):
+        return False
+    return bool(_SOURCE_LETTERS.search(source)) and bool(_SOURCE_LETTERS.search(translated))
+
+
+def _without_echoes(
+    mapped: dict[str, str], texts: list[str], target: str
+) -> tuple[dict[str, str], list[str]]:
+    """Убрать из ответа реплики, вернувшиеся исходным текстом."""
+    echoed = sorted(
+        identifier
+        for identifier, text in mapped.items()
+        if identifier.isdigit() and int(identifier) < len(texts)
+        if _untranslated(texts[int(identifier)], text, target)
+    )
+    return {key: value for key, value in mapped.items() if key not in echoed}, echoed
 
 def _translated_only(answer: str) -> dict[str, str]:
     """Разобрать ответ и выбросить пустые переводы.
